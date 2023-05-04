@@ -228,11 +228,11 @@ void Master::waitReduceTask() {
     //因为master需要实现reduce任务的超时重分配,若超时后在对应的hashmap
     //中没有该reduce任务完成的记录，将该任务重新加入工作队列reduceIndex
     if (!finishedReduceTask.count(runningReduceWork[curReduceIndex])) {
-        for(auto a : reduce->m_list) printf(" before insert %s\n", a);
+        for(auto a : m_list) printf(" before insert %s\n", a);
         reduceIndex.emplace_back(runningReduceWork[curReduceIndex]);
         printf("reduce %d is timeout\n", runningReduceWork[curReduceIndex]);
         curReduceIndex++;
-        for(auto a : reduce->m_list) printf(" after insert %s\n", a);
+        for(auto a : m_list) printf(" after insert %s\n", a);
         lock.unlock();
         return;
     }
