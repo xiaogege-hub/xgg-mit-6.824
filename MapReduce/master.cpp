@@ -44,7 +44,7 @@ private:
 
   void waitReduceTask();      //回收reduce的定时线程
 
-  void waitTime(char op);     //用于定时的线程
+  void waitTime(char& op);     //用于定时的线程
 
 private:
   mutex m_assign_lock;      // 保护共享数据的锁
@@ -72,7 +72,7 @@ private:
   int curReduceIndex;             // 当前处理第几个reduce任务
 };
 
-Master::Master(int mapNum = 8, int reduceNum = 8)
+Master::Master(int mapNum, int reduceNum)
     :m_mapNum(mapNum), m_reduceNum(reduceNum) {
   m_list.clear();
   reduceIndex.clear();
@@ -178,7 +178,7 @@ void Master::waitMap(string filename) {
     runningMapWork.push_back(filename);  
   }
   // 创建一个用于回收计时线程并处理超时逻辑的线程
-  thread t(&Master::waitMapTask);
+  thread t(&Master::waitMapTask, this);
   t.detach();
 }
 
@@ -190,14 +190,14 @@ void Master::waitReduce(int reduceIdx) {
         runningReduceWork.push_back(reduceIdx);
     }
     // 创建一个用于回收计时线程及处理超时逻辑的线程
-    thread t(&Master::waitReduceTask);
+    thread t(&Master::waitReduceTask, this);
     t.detach();
 }
 
 void Master::waitMapTask() {
     //标记这是map任务
     char op = 'm';
-    thread t_time(&Master::waitTime, op);
+    thread t_time(&Master::waitTime, this, std::ref(op));
     //join方式回收实现超时后解除阻塞
     t_time.join();
 
@@ -221,7 +221,7 @@ void Master::waitMapTask() {
 void Master::waitReduceTask() {
     //标记这是reduce任务
     char op = 'r';
-    thread t_time(&Master::waitTime, op);
+    thread t_time(&Master::waitTime, this, std::ref(op));
     t_time.join();
 
     unique_lock<mutex> lock(m_assign_lock);
@@ -243,7 +243,7 @@ void Master::waitReduceTask() {
 }
 
 //区分map任务还是reduce任务，执行不同时间计时的计时线程
-void Master::waitTime(char op) {
+void Master::waitTime(char& op) {
     if (op == 'm') {
         sleep(MAP_TASK_TIMEOUT);
     }
