@@ -171,8 +171,7 @@ void Worker::reduceWorker() {
         map_mutex.unlock();
         //----人为设置的crash线程，会导致超时，用于超时功能的测试------
 
-        //3、取得reduce任务，读取中间文件，shuffle后调用reduceFunc进行reduce处理
-        //shuffle完，kvs中每个元素的形式为"abc 11111"
+        //3、取得reduce任务，各个线程读取各自reduceTaskId对应的中间文件，shuffle后调用reduceFunc进行reduce处理，shuffle完，kvs中每个元素的形式为"abc 11111"
         vector<KeyValue> kvs = myShuffle(reduceTaskId);
 
         //4、执行reduce函数，并记录结果在str中 str中是形如"abc 4"的字符串
@@ -214,12 +213,12 @@ KeyValue Worker::getContent(char* file) {
   return kv;
 }
 
-//对于一个ReduceTask，获取所有中间文件并将value的list以string写入vector
-//vector中每个元素的形式为"abc 11111",记录在vector中return
+//对于一个ReduceTask，获取reduceTaskId对应的中间文件，并将value的list以string写入vector，vector中每个元素的形式为"abc 11111",记录在vector中return
 vector<KeyValue> Worker::myShuffle(int reduceTaskId){
     string path;
     vector<string> strs;
     strs.clear();
+    //通过getAllfile获取reduceTaskId对应的文件名，即得到了各个线程对应的reduce task
     vector<string> filename = getAllfile(".", reduceTaskId);
     unordered_map<string, string> hash;
     for (int i = 0; i < filename.size(); i++) {
