@@ -8,11 +8,45 @@
 #include <string>
 #include <fcntl.h>
 #include <unistd.h>
+#include <algorithm>
 #include "./buttonrpc-master/buttonrpc.hpp"
 using namespace std;
 
 #define COMMON_PORT 1234
 #define HEART_BEAT_PERIOD 100000
+
+//需要结合LAB3实现应用层dataBase和Raft交互用的，通过getCmd()转化为applyMsg的command
+//实际上这只是LAB2的raft.hpp，在LAB3中改了很多，LAB4又改了不少，所以每个LAB都引了单独的raft.hpp
+class Operation {
+public:
+    string getCmd();
+    string op;
+    string key;
+    string value;
+    int clientId;
+    int requestId;
+};
+
+string Operation::getCmd() {
+    string cmd = op + " " + key + " " + value;
+    return cmd;
+}
+
+//通过传入raft.start()得到的返回值，封装成类
+class StartRet {
+public:
+    StartRet() : cmdIndex(-1), curTerm(-1), isLeader(false) {}
+    int cmdIndex;
+    int curTerm;
+    bool isLeader;
+};
+
+//同应用层交互的需要提交到应用层并apply的封装成applyMsg的日志信息
+class ApplyMsg {
+    bool CommandValid;
+	string command;
+    int CommandIndex;
+};
 
 // 封装了各个server暴露出来的RPC端口号以及自己对应的RaftId
 // 每个server有两个RPC端口号(为了减轻负担，一个选举，一个日志同步)
@@ -60,9 +94,14 @@ public:
     int prevLogTerm;  // term of prevLogIndex entry
     int leaderCommit; // leader’s commitIndex
     string sendLogs;  // 发送的日志条目（对于心跳为空；为了提高效率，可能会发送多个）
-    //Todo...
-
-
+    friend Serializer& operator >> (Serializer& in, AppendEntriesArgs& d) {
+        in >> d.term >> d.leaderId >> d.prevLogIndex >> d.prevLogTerm >> d.prevLogTerm >> d.leaderCommit >> d.sendLogs;
+        return in;
+    }
+    friend Serializer& operator << (Serializer& out, AppendEntriesArgs d) {
+		out << d.term << d.leaderId << d.prevLogIndex << d.prevLogTerm << d.leaderCommit << d.sendLogs;
+		return out;
+	}
 };
 
 struct AppendEntriesReply {
@@ -80,20 +119,26 @@ public:
     void Make(vector<PeersInfo> peers, int id);        //raft初始化
     RequestVoteReply requestVote(RequestVoteArgs args);// Invoked by candidates to gather votes; RPC调用
     AppendEntriesReply appendEntries(AppendEntriesArgs args);// Invoked by leader to replicate log entries; also used as heartbeat; RPC调用
-
+    pair<int, bool> getState();//在LAB3中会用到，提前留出来的接口判断是否leader
+    StartRet start(Operation op);//向raft传日志的函数，只有leader响应并立即返回，应用层用到
+    void kill();//设定raft状态为dead，LAB3B快照测试时会用到
 private:
     void listenForVote();       //用于监听voteRPC的server线程
     void listenForAppend();     //用于监听appendRPC的server线程
+    void applyLogLoop();        //持续向上层应用日志的守护线程
     void electionLoop();        //持续处理选举的守护线程
     void processEntriesLoop();  //持续处理日志同步的守护线程
     void callRequestVote();     //发voteRPC的线程
     void sendAppendEntries();   //发appendRPC的线程
-    
 
     //判断是否最新日志(两个准则)，requestVote时会用到
     bool checkLogUptodate(int lastLogTerm, int lastLogIndex);  
-    int getMyduration(timeval lastTime);//传入某个特定时间，计算该时间到当下的持续时间
-    void setBroadcastTime();//重新设定BroadcastTime，成为leader发心跳的时候需要重置
+    //传入某个特定时间，计算该时间到当下的持续时间
+    int getMyduration(timeval lastTime);
+    //用的RPC不支持传容器，所以封装成string，这个是解封装恢复函数
+    vector<LogEntry> getCmdAndTerm(string text);
+    //重新设定BroadcastTime，成为leader发心跳的时候需要重置
+    void setBroadcastTime();
 
     void saveRaftState();       //保存持久化状态
     void serialize();           //序列化
@@ -158,6 +203,8 @@ void Raft::Make(vector<PeersInfo> peers, int id) {
     listen_tid1.detach();
     thread listen_tid2(&Raft::listenForAppend, this);
     listen_tid2.detach();
+    thread listen_tid3(&Raft::applyLogLoop, this);
+    listen_tid3.detach();
 }
 
 //用于监听requestVote RPC调用的server线程
@@ -187,6 +234,22 @@ void Raft::listenForAppend() {
     server.run();
     printf("exit!\n");
 }   
+
+void Raft::applyLogLoop() {
+    while (!m_dead) {
+        usleep(10000);
+        m_lock.lock();
+        for (int i = m_lastApplied; i < m_commitIndex; i++) {
+            /**
+             * @brief 封装好信息发回给客户端, LAB3中会用
+             *     ApplyMsg msg;
+             * 
+             */
+        }
+        m_lastApplied = m_commitIndex;
+        m_lock.unlock();
+    }
+}
 
 //持续处理选举的守护线程 
 void Raft::electionLoop() {
@@ -223,9 +286,13 @@ void Raft::electionLoop() {
                     tid[i].detach();
                     i++;
                 }
-                while (recvVotes <= m_peers.size() / 2 && finishedVotes != m_peers.size()) {
+                /*while (recvVotes <= m_peers.size() / 2 && finishedVotes != m_peers.size()) {
                     m_cond.wait(lock);
-                }
+                }*/
+                m_cond.wait(lock, [this]{
+                    if (recvVotes <= m_peers.size() / 2 && finishedVotes != m_peers.size()) return false;
+                    return true;
+                });
                 if (m_state != CANDIDATE) {
                     lock.unlock();
                     continue;
@@ -335,21 +402,18 @@ void Raft::sendAppendEntries() {
     args.leaderId = m_peerId;
     args.prevLogIndex = m_nextIndex[clientPeerId] - 1;
     args.leaderCommit = m_commitIndex;
-
-    for (int i = args.prevLogIndex; i < m_logs.size(); i++) {
+    for (int i = args.prevLogIndex; i < m_logs.size(); i++) {//先记录sendLogs
         args.sendLogs += (m_logs[i].command + "," + to_string(m_logs[i].term) + ";");
     }
-    if (args.prevLogIndex == 0) {
+    if (args.prevLogIndex == 0) {  // 再更新prevLogTerm
         args.prevLogTerm = 0;
         if (m_logs.size() != 0) {
-            //todo
-
+            args.prevLogTerm = m_logs[0].term;
         }
+    } 
+    else args.prevLogTerm = m_logs[args.prevLogIndex - 1].term;
 
-    }
-    else {
-        //todo
-    }
+    printf("[%d] -> [%d]'s prevLogIndex : %d, prevLogTerm : %d\n", m_peerId, clientPeerId, args.prevLogIndex, args.prevLogTerm);
 
     if (cur_peerId == m_peers.size() || (cur_peerId == m_peers.size() - 1 && cur_peerId == m_peerId)) {
         cur_peerId = 0;
@@ -359,15 +423,45 @@ void Raft::sendAppendEntries() {
     AppendEntriesReply reply = client.call<AppendEntriesReply>("appendEntries", args).val();
 
     m_lock.lock();
-    if (reply.term )
+    if (reply.term > m_currentTerm) {
+        m_state = FOLLOWER;
+        m_currentTerm = reply.term;
+        m_votedFor = -1;
+        saveRaftState();
+        m_lock.unlock();
+        return;//FOLLOWER没必要维护nextIndex,成为leader会更新
+    }
+    if (reply.success) {
+        m_nextIndex[clientPeerId] += getCmdAndTerm(args.sendLogs).size();
+        m_matchIndex[clientPeerId] = m_nextIndex[clientPeerId] - 1;
 
-   
-
-
-
-
-
-
+        vector<int> tmpIndex = m_matchIndex;
+        sort(tmpIndex.begin(), tmpIndex.end());
+        int realMajorityMatchIndex = tmpIndex[tmpIndex.size() / 2];
+        if (realMajorityMatchIndex > m_commitIndex && m_logs[realMajorityMatchIndex - 1].term == m_currentTerm) {
+            m_commitIndex = realMajorityMatchIndex;
+        }
+    }
+    if (!reply.success) {
+        if(reply.conflict_term != -1){
+            int leader_conflict_index = -1;
+            for(int index = args.prevLogIndex; index >= 1; index--){
+                if(m_logs[index - 1].term == reply.conflict_term){
+                    leader_conflict_index = index;
+                    break;
+                }
+            }
+            if(leader_conflict_index != -1){
+                m_nextIndex[clientPeerId] = leader_conflict_index + 1;
+            }else{
+                m_nextIndex[clientPeerId] = reply.conflict_term;
+            }
+        }else{
+            m_nextIndex[clientPeerId] = reply.conflict_index + 1;
+        }
+    }
+    saveRaftState();
+    m_lock.unlock();
 }
 
 //Invoked by candidates to gather votes; RPC调用
@@ -410,17 +504,16 @@ RequestVoteReply Raft::requestVote(RequestVoteArgs args) {
 
 //Invoked by leader to replicate log entries; also used as heartbeat; RPC调用
 AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args) {
-
-
+    vector<LogEntry> recvLog = getCmdAndTerm(args.sendLogs);
     AppendEntriesReply reply;
+    m_lock.lock();
+    reply.term = m_currentTerm;
     reply.success = false;
     reply.conflict_index = -1;
     reply.conflict_term = -1;
-    m_lock.lock();
-    reply.term = m_currentTerm;
-
+    
+    //1.Reply false if term < currentTerm
     if (args.term < m_currentTerm) {
-        //leader's term < m_currentTerm 直接return false
         m_lock.unlock();
         return reply;
     }
@@ -432,9 +525,95 @@ AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args) {
         m_state = FOLLOWER;
     }
     printf("[%d] recv append from [%d] at self term %d, send term %d, duration is %d\n", m_peerId, args.leaderId, m_currentTerm, args.term, getMyduration(m_lastWakeTime));
+    //任何一条AppendEntries消息都会重置所有Raft节点的选举定时器
     gettimeofday(&m_lastWakeTime, NULL);//更新m_lastWakeTime
 
+    int logSize = 0;
+    //4.Append any new entries not already in the log
+    if (m_logs.size() == 0) {
+        for (const auto& log : recvLog) {
+            m_logs.push_back(log);
+        }
+        logSize = m_logs.size();
+        //5.If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+        if (m_commitIndex < args.leaderCommit) {
+            m_commitIndex = min(args.leaderCommit, logSize);
+        }
+        m_lock.unlock();
+        reply.success = true;
+        return reply;
+    }
+    //2.Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+    if (m_logs.size() < args.prevLogIndex) {
+        printf("[%d]'s logs.size : %d < [%d]'s prevLogIdx : %d\n", m_peerId, m_logs.size(), args.leaderId, args.prevLogIndex);
+        reply.conflict_index = m_logs.size();//索引要加1
+        m_lock.unlock();
+        reply.success = false;
+        return reply;
+    }
+    //3.If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+    if (args.prevLogIndex > 0 && m_logs[args.prevLogIndex - 1].term != args.prevLogTerm) {
+        printf("[%d]'s prevLogterm : %d != [%d]'s prevLogTerm : %d\n", m_peerId, m_logs[args.prevLogIndex - 1].term, args.leaderId, args.prevLogTerm);
+        reply.conflict_term = m_logs[args.prevLogIndex - 1].term;
+        for (int index = 1; index <= args.prevLogIndex; index++) {
+            if (m_logs[index - 1].term == reply.conflict_term) {
+                //找到冲突term的第一个index,比索引要加1
+                reply.conflict_index = index;
+                break;
+            }
+        }
+        m_lock.unlock();
+        reply.success = false;
+        return reply;
+    }
+    logSize = m_logs.size();
+    for (int i = args.prevLogIndex; i < logSize; i++) {
+        m_logs.pop_back();
+    }
+    for (const auto& log : recvLog) {
+        m_logs.push_back(log);
+    }
+    saveRaftState();
+    logSize = m_logs.size();
+    if (m_commitIndex < args.leaderCommit) {
+        m_commitIndex = min(args.leaderCommit, logSize);
+    }
+    for(const auto& log : m_logs) printf("%d ", log.term);
+    printf(" [%d] sync success\n", m_peerId);
+    m_lock.unlock();
+    reply.success = true;
+    return reply;
+}
 
+pair<int, bool> Raft::getState() {
+    pair<int, bool> serverState;
+    serverState.first = m_currentTerm;
+    serverState.second = (m_state == LEADER);
+    return serverState;
+}
+
+StartRet Raft::start(Operation op) {
+    StartRet ret;
+    m_lock.lock();
+    RAFT_STATE state = m_state;
+    if (state != LEADER) {
+        m_lock.unlock();
+        return ret;
+    }
+    ret.cmdIndex = m_logs.size();
+    ret.curTerm = m_currentTerm;
+    ret.isLeader = true;
+
+    LogEntry log;
+    log.command = op.getCmd();
+    log.term = m_currentTerm;
+    m_logs.push_back(log);
+    m_lock.unlock();
+    return ret;
+}
+
+void Raft::kill() {
+    m_dead = true;
 }
 
 //判断是否最新日志(两个准则)，requestVote时会用到
@@ -464,6 +643,36 @@ int Raft::getMyduration(timeval lastTime) {
     struct timeval now;
     gettimeofday(&now, NULL);
     return ((now.tv_sec - lastTime.tv_sec) * 1000000 + (now.tv_usec - lastTime.tv_usec));
+}
+
+vector<LogEntry> Raft::getCmdAndTerm(string text) {
+    vector<LogEntry> logs;
+    int n = text.size();
+    vector<string> str;
+    string tmp = "";
+    for (int i = 0; i < n; i++) {
+        if (text[i] != ';') {
+            tmp += text[i];
+        }
+        else {
+            if (tmp.size() != 0) str.push_back(tmp);
+            tmp = "";
+        }
+    }
+    for (int i = 0; i < str.size(); i++) {
+        tmp = "";
+        int j = 0;
+        for (; j < str[i].size(); j++) {
+            if (str[i][j] != ',') {
+                tmp += str[i][j];
+            }
+            else break;
+        }
+        string number(str[i].begin() + j + 1, str[i].end());
+        int num = atoi(number.c_str());
+        logs.push_back(LogEntry(tmp, num));
+    }
+    return logs;
 }
 
 //稍微解释下-200000us是因为让记录的m_lastBroadcastTime变早，这样在appendLoop中getMyduration(m_lastBroadcastTime)直接达到要求
@@ -590,7 +799,7 @@ bool Raft::deserialize() {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        printf("loss parameter of perrsNum\n");
+        printf("loss parameter of peersNum\n");
         exit(-1);
     }
     int peersNum = atoi(argv[1]);
@@ -615,5 +824,31 @@ int main(int argc, char* argv[]) {
         raft[i].Make(peers, i);
     }
 
-
+    //------------------------------test部分--------------------------
+    usleep(400000);
+    for (int i = 0; i < peers.size(); i++) {
+        bool isLeader = raft[i].getState().second;
+        if (isLeader) {
+            for (int j = 0; j < 1000; j++) {
+                Operation opera;
+                opera.op = "put";
+                opera.key = to_string(j);
+                opera.value = to_string(j);
+                raft[i].start(opera);
+                usleep(50000);
+            }
+        }
+        else continue;
+    }
+    usleep(400000);
+    for (int i = 0; i < peers.size(); i++) {
+        bool isLeader = raft[i].getState().second;
+        if (isLeader) {
+            ////kill后选举及心跳的线程会宕机，会产生新的leader，很久之后了，因为上面传了1000条日志
+            raft[i].kill();
+            break;
+        }
+    }
+    //------------------------------test部分--------------------------
+    while(1);
 }
